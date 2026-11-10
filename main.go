@@ -28,6 +28,8 @@ const (
         PoWTarget        = 20
         RateLimitPerMin  = 30
         WSHeartbeat      = 30 * time.Second
+        // Peer-pubkey records expire after 30 days of inactivity.
+        PeerTTL = 30 * 24 * 3600
 )
 
 type EnvelopeUpload struct {
@@ -97,7 +99,11 @@ func initDB(path string) (*sql.DB, error) {
                 ciphertext BLOB NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
                 delivered INTEGER DEFAULT 0, delivered_at INTEGER, size_class TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_receiver ON envelopes(receiver_id, delivered);
-        CREATE INDEX IF NOT EXISTS idx_expires ON envelopes(expires_at);`
+        CREATE INDEX IF NOT EXISTS idx_expires ON envelopes(expires_at);
+        CREATE TABLE IF NOT EXISTS peers (
+                device_id TEXT PRIMARY KEY, x25519_pub TEXT NOT NULL, ed25519_pub TEXT,
+                display_name TEXT, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_peers_expires ON peers(expires_at);`
         _, err = db.Exec(schema)
         return db, err
 }
@@ -117,8 +123,11 @@ func (r *Relay) sweep() {
         t := time.NewTicker(TTLSweepInterval)
         defer t.Stop()
         for range t.C {
-                n, _ := r.db.Exec(`DELETE FROM envelopes WHERE expires_at < ?`, time.Now().Unix())
-                if rows, _ := n.RowsAffected(); rows > 0 { log.Printf("TTL: purged %d", rows) }
+                now := time.Now().Unix()
+                n, _ := r.db.Exec(`DELETE FROM envelopes WHERE expires_at < ?`, now)
+                if rows, _ := n.RowsAffected(); rows > 0 { log.Printf("TTL: purged %d envelopes", rows) }
+                np, _ := r.db.Exec(`DELETE FROM peers WHERE expires_at < ?`, now)
+                if rows, _ := np.RowsAffected(); rows > 0 { log.Printf("TTL: purged %d peers", rows) }
         }
 }
 
@@ -241,6 +250,77 @@ func (r *Relay) ws(w http.ResponseWriter, req *http.Request) {
         for { if _, _, err := conn.ReadMessage(); err != nil { break } }
 }
 
+// ===== Peer-pubkey exchange (for relay-mediated ECDH handshake) =====
+//
+// Per CRYPTO-SPEC-FINAL §3: after QR scan, the receiver needs the sender's
+// X25519 pubkey. The QR already carries it, but the REVERSE direction
+// (sender needs receiver's X25519 pubkey) requires a relay round-trip.
+// We expose:
+//   PUT  /peer/<deviceId>     — publish your X25519 pub (idempotent)
+//   GET  /peer/<deviceId>     — fetch a peer's X25519 pub
+//   DELETE /peer/<deviceId>   — revoke your pub (e.g., on nuke)
+//
+// Auth: PUT/DELETE require X-Device-ID header == deviceId in path.
+// No PoW required (these are tiny records, not envelopes).
+//
+// Stored record: {deviceId, x25519_pub, ed25519_pub, display_name, updated_at, expires_at}
+
+func (r *Relay) putPeer(w http.ResponseWriter, req *http.Request) {
+        id := strings.TrimPrefix(req.URL.Path, "/peer/")
+        dev := req.Header.Get("X-Device-ID")
+        if dev == "" { http.Error(w, `{"error":"no_device"}`, 401); return }
+        if dev != id { http.Error(w, `{"error":"unauthorized"}`, 403); return }
+        var body struct {
+                X25519Pub   string `json:"x25519_pub"`
+                Ed25519Pub  string `json:"ed25519_pub"`
+                DisplayName string `json:"display_name"`
+        }
+        if err := json.NewDecoder(req.Body).Decode(&body); err != nil { http.Error(w, `{"error":"bad_json"}`, 400); return }
+        if body.X25519Pub == "" { http.Error(w, `{"error":"missing_x25519"}`, 400); return }
+        now := time.Now().Unix()
+        _, err := r.db.Exec(`INSERT INTO peers (device_id, x25519_pub, ed25519_pub, display_name, updated_at, expires_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                x25519_pub=excluded.x25519_pub,
+                ed25519_pub=excluded.ed25519_pub,
+                display_name=excluded.display_name,
+                updated_at=excluded.updated_at,
+                expires_at=excluded.expires_at`,
+                id, body.X25519Pub, body.Ed25519Pub, body.DisplayName, now, now+int64(PeerTTL))
+        if err != nil { http.Error(w, `{"error":"db"}`, 500); return }
+        json.NewEncoder(w).Encode(map[string]string{"status":"ok","device_id":id})
+        log.Printf("PEER PUT %s", id[:8])
+}
+
+func (r *Relay) getPeer(w http.ResponseWriter, req *http.Request) {
+        id := strings.TrimPrefix(req.URL.Path, "/peer/")
+        var x25519, ed25519, name string; var updated, expires int64
+        err := r.db.QueryRow(`SELECT x25519_pub, ed25519_pub, display_name, updated_at, expires_at FROM peers WHERE device_id=?`, id).
+                Scan(&x25519, &ed25519, &name, &updated, &expires)
+        if err == sql.ErrNoRows { http.Error(w, `{"error":"not_found"}`, 404); return }
+        if err != nil { http.Error(w, `{"error":"db"}`, 500); return }
+        if time.Now().Unix() > expires { r.db.Exec(`DELETE FROM peers WHERE device_id=?`, id); http.Error(w, `{"error":"expired"}`, 410); return }
+        json.NewEncoder(w).Encode(map[string]interface{}{
+                "device_id":    id,
+                "x25519_pub":   x25519,
+                "ed25519_pub":  ed25519,
+                "display_name": name,
+                "updated_at":   updated,
+                "expires_at":   expires,
+        })
+        log.Printf("PEER GET %s", id[:8])
+}
+
+func (r *Relay) deletePeer(w http.ResponseWriter, req *http.Request) {
+        id := strings.TrimPrefix(req.URL.Path, "/peer/")
+        dev := req.Header.Get("X-Device-ID")
+        if dev == "" { http.Error(w, `{"error":"no_device"}`, 401); return }
+        if dev != id { http.Error(w, `{"error":"unauthorized"}`, 403); return }
+        r.db.Exec(`DELETE FROM peers WHERE device_id=?`, id)
+        w.WriteHeader(204)
+        log.Printf("PEER DEL %s", id[:8])
+}
+
 func main() {
         dbPath := os.Getenv("TOTE_RELAY_DB"); if dbPath == "" { dbPath = "tote-relay.db" }
         port := os.Getenv("TOTE_RELAY_PORT"); if port == "" { port = "8443" }
@@ -263,6 +343,14 @@ func main() {
         })
         mux.HandleFunc("/inbox/", func(w http.ResponseWriter, req *http.Request) {
                 if strings.Contains(req.URL.Path, "/events") { r.ws(w, req) } else { r.poll(w, req) }
+        })
+        mux.HandleFunc("/peer/", func(w http.ResponseWriter, req *http.Request) {
+                switch req.Method {
+                case "GET": r.getPeer(w, req)
+                case "PUT": r.putPeer(w, req)
+                case "DELETE": r.deletePeer(w, req)
+                default: http.Error(w, `{"error":"method"}`, 405)
+                }
         })
         log.Printf("Tote relay on :%s (db=%s)", port, dbPath)
         log.Fatal(http.ListenAndServe(":"+port, mux))
